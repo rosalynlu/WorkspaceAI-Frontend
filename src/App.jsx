@@ -232,6 +232,15 @@ export default function App() {
   };
 
   useEffect(() => {
+    const params = new URLSearchParams(window.location.search);
+    if (params.get("google_connected") === "1") {
+      setConnected(true);
+      // clean URL
+      window.history.replaceState({}, "", "/");
+    }
+  }, []);
+
+  useEffect(() => {
     if (!chatWindowRef.current) return;
     chatWindowRef.current.scrollTo({
       top: chatWindowRef.current.scrollHeight,

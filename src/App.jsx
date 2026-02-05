@@ -9,7 +9,7 @@ const decodeJwt = (token) => {
     const normalized = payload.replace(/-/g, "+").replace(/_/g, "/");
     const decoded = atob(normalized);
     return JSON.parse(decoded);
-  } catch (err) {
+  } catch {
     return null;
   }
 };
@@ -25,9 +25,7 @@ const useGoogleReady = () => {
         setReady(true);
         return;
       }
-      if (attempts < 40) {
-        setTimeout(tick, 150);
-      }
+      if (attempts < 40) setTimeout(tick, 150);
     };
     tick();
   }, []);
@@ -37,17 +35,21 @@ const useGoogleReady = () => {
 
 export default function App() {
   const [credential, setCredential] = useState("");
+  const [accessToken, setAccessToken] = useState("");
   const [profile, setProfile] = useState(null);
   const [error, setError] = useState("");
   const [backendStatus, setBackendStatus] = useState(null);
   const [userId, setUserId] = useState("");
   const [connected, setConnected] = useState(false);
+
   const [authMode, setAuthMode] = useState("signin");
   const [emailInput, setEmailInput] = useState("");
   const [passwordInput, setPasswordInput] = useState("");
   const [registerEmail, setRegisterEmail] = useState("");
   const [registerPassword, setRegisterPassword] = useState("");
+
   const oauthGroupRef = useRef(null);
+
   const [messages, setMessages] = useState([
     {
       id: "welcome",
@@ -58,36 +60,43 @@ export default function App() {
   ]);
   const [draft, setDraft] = useState("");
   const [isResponding, setIsResponding] = useState(false);
-  const chatEndRef = useRef(null);
   const chatWindowRef = useRef(null);
-  const ready = useGoogleReady();
 
+  // Confirmation state
+  // { actionRequestId: string, message: string }
+  const [pendingConfirmation, setPendingConfirmation] = useState(null);
+
+  const ready = useGoogleReady();
   const clientMissing = useMemo(() => CLIENT_ID.trim().length === 0, []);
 
+  // Restore session
   useEffect(() => {
     const stored = window.localStorage.getItem("workspaceai.session");
     if (!stored) return;
     try {
       const payload = JSON.parse(stored);
       if (payload.credential) setCredential(payload.credential);
+      if (payload.accessToken) setAccessToken(payload.accessToken);
       if (payload.profile) setProfile(payload.profile);
       if (payload.userId) setUserId(payload.userId);
-    } catch (err) {
+    } catch {
       window.localStorage.removeItem("workspaceai.session");
     }
   }, []);
 
+  // Persist session
   useEffect(() => {
-    if (!credential && !profile && !userId) {
+    if (!credential && !profile && !userId && !accessToken) {
       window.localStorage.removeItem("workspaceai.session");
       return;
     }
     window.localStorage.setItem(
       "workspaceai.session",
-      JSON.stringify({ credential, profile, userId })
+      JSON.stringify({ credential, profile, userId, accessToken })
     );
-  }, [credential, profile, userId]);
+  }, [credential, accessToken, profile, userId]);
 
+  // Google Sign-in button
   useEffect(() => {
     if (!ready || clientMissing) return;
 
@@ -100,19 +109,17 @@ export default function App() {
       },
     });
 
-    window.google.accounts.id.renderButton(
-      document.getElementById("google-signin"),
-      {
-        theme: "outline",
-        size: "large",
-        shape: "pill",
-        width: Math.min(400, oauthGroupRef.current?.offsetWidth || 400),
-      }
-    );
+    window.google.accounts.id.renderButton(document.getElementById("google-signin"), {
+      theme: "outline",
+      size: "large",
+      shape: "pill",
+      width: Math.min(400, oauthGroupRef.current?.offsetWidth || 400),
+    });
 
     window.google.accounts.id.prompt();
   }, [ready, clientMissing]);
 
+  // Verify Google ID token with backend -> get user_id + access_token (JWT)
   useEffect(() => {
     if (!credential) return;
 
@@ -132,8 +139,13 @@ export default function App() {
 
         const payload = await response.json();
         setBackendStatus({ state: "ok", payload });
+
         const id = payload.user_id || "";
         setUserId(id);
+
+        const token = payload.access_token || "";
+        setAccessToken(token);
+
         if (id) {
           fetch(`${BACKEND_URL}/auth/google/status?user_id=${id}`)
             .then((res) => res.json())
@@ -148,13 +160,34 @@ export default function App() {
     verify();
   }, [credential]);
 
+  // If backend redirects back with ?google_connected=1, update UI and clean URL
+  useEffect(() => {
+    const params = new URLSearchParams(window.location.search);
+    if (params.get("google_connected") === "1") {
+      setConnected(true);
+      window.history.replaceState({}, "", "/");
+    }
+  }, []);
+
+  // Auto-scroll chat
+  useEffect(() => {
+    if (!chatWindowRef.current) return;
+    chatWindowRef.current.scrollTo({
+      top: chatWindowRef.current.scrollHeight,
+      behavior: "smooth",
+    });
+  }, [messages, isResponding, pendingConfirmation]);
+
   const resetSession = () => {
     setCredential("");
+    setAccessToken("");
     setProfile(null);
     setError("");
     setBackendStatus(null);
     setConnected(false);
     setUserId("");
+    setPendingConfirmation(null);
+
     window.localStorage.removeItem("workspaceai.session");
     window.google?.accounts?.id?.disableAutoSelect();
   };
@@ -162,91 +195,197 @@ export default function App() {
   const connectGoogle = async () => {
     if (!userId) return;
     try {
-      const response = await fetch(
-        `${BACKEND_URL}/auth/google/authorize?user_id=${userId}`
-      );
+      const response = await fetch(`${BACKEND_URL}/auth/google/authorize?user_id=${userId}`);
       const payload = await response.json();
       if (payload.auth_url) {
         window.location.href = payload.auth_url;
       }
-    } catch (err) {
+    } catch {
       setError("Failed to start Google authorization.");
     }
   };
 
-  const sendMessage = (event) => {
-    event.preventDefault();
-    if (!draft.trim()) return;
+  const sendConfirmation = async (approved) => {
+    if (!pendingConfirmation?.actionRequestId) return;
+
     const now = new Date();
     const time = now.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+
+    try {
+      setIsResponding(true);
+
+      if (!accessToken) {
+        throw new Error("You’re not authenticated. Please sign in again.");
+      }
+
+      // Add an optional UX bubble showing the user's decision
+      setMessages((prev) => [
+        ...prev,
+        {
+          id: `${now.getTime()}-decision`,
+          role: "user",
+          text: approved ? "Approve" : "Cancel",
+          time,
+        },
+      ]);
+
+      const response = await fetch(`${BACKEND_URL}/api/confirm`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${accessToken}`,
+        },
+        body: JSON.stringify({
+          action_request_id: pendingConfirmation.actionRequestId,
+          approved,
+        }),
+      });
+
+      if (!response.ok) {
+        const payload = await response.json().catch(() => ({}));
+        throw new Error(payload.detail || "Confirmation failed");
+      }
+
+      const payload = await response.json();
+
+      const reply =
+        payload.summary ||
+        (approved ? "Done." : "Okay — I won’t do that.");
+
+      setMessages((prev) => [
+        ...prev,
+        {
+          id: `${now.getTime()}-confirm-reply`,
+          role: "assistant",
+          text: reply,
+          time,
+        },
+      ]);
+
+      setPendingConfirmation(null);
+    } catch (err) {
+      setMessages((prev) => [
+        ...prev,
+        {
+          id: `${Date.now()}-confirm-error`,
+          role: "assistant",
+          text: err.message || "Something went wrong.",
+          time,
+        },
+      ]);
+    } finally {
+      setIsResponding(false);
+    }
+  };
+
+  const sendMessage = async (event) => {
+    event.preventDefault();
+    if (!draft.trim()) return;
+
+    const now = new Date();
+    const time = now.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+
     const next = {
       id: `${now.getTime()}`,
       role: "user",
       text: draft.trim(),
       time,
     };
+
     setMessages((prev) => [...prev, next]);
     setDraft("");
     setIsResponding(true);
 
-    if (!userId) {
+    if (!accessToken) {
       setIsResponding(false);
+      setMessages((prev) => [
+        ...prev,
+        {
+          id: `${now.getTime()}-reply`,
+          role: "assistant",
+          text: "You’re not authenticated. Please sign in again.",
+          time,
+        },
+      ]);
       return;
     }
 
-    fetch(`${BACKEND_URL}/api/respond`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ message: next.text, user_id: userId }),
-    })
-      .then(async (response) => {
-        if (!response.ok) {
-          const payload = await response.json().catch(() => ({}));
-          throw new Error(payload.detail || "Chat request failed");
-        }
-        return response.json();
-      })
-      .then((payload) => {
-        const reply =
-          payload.summary ||
-          JSON.stringify(payload.results || payload, null, 2) ||
-          "I completed that request. Let me know what to do next.";
-        setMessages((prev) => [
-          ...prev,
-          { id: `${now.getTime()}-reply`, role: "assistant", text: reply, time },
-        ]);
-        setIsResponding(false);
-      })
-      .catch((err) => {
+    try {
+      const response = await fetch(`${BACKEND_URL}/api/respond`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${accessToken}`,
+        },
+        body: JSON.stringify({ message: next.text }),
+      });
+
+      if (!response.ok) {
+        const payload = await response.json().catch(() => ({}));
+        throw new Error(payload.detail || "Chat request failed");
+      }
+
+      const payload = await response.json();
+
+      // CASE 1: needs confirmation
+      if (payload.status === "needs_confirmation") {
+        const confirmationText =
+          payload.confirmation_message || "Approve this action?";
+
+        setPendingConfirmation({
+          actionRequestId: payload.action_request_id,
+          message: confirmationText,
+        });
+
         setMessages((prev) => [
           ...prev,
           {
-            id: `${now.getTime()}-reply`,
+            id: `${Date.now()}-confirm`,
             role: "assistant",
-            text: err.message || "Something went wrong.",
-            time,
+            text: confirmationText,
+            time: new Date().toLocaleTimeString([], {
+              hour: "2-digit",
+              minute: "2-digit",
+            }),
+            needsConfirmation: true,
+            actionRequestId: payload.action_request_id,
           },
         ]);
+
         setIsResponding(false);
-      });
-  };
+        return;
+      }
 
-  useEffect(() => {
-    const params = new URLSearchParams(window.location.search);
-    if (params.get("google_connected") === "1") {
-      setConnected(true);
-      // clean URL
-      window.history.replaceState({}, "", "/");
+      // CASE 2: normal completion
+      const reply =
+        payload.summary || "I completed that request. Let me know what to do next.";
+
+      setMessages((prev) => [
+        ...prev,
+        {
+          id: `${Date.now()}-reply`,
+          role: "assistant",
+          text: reply,
+          time: new Date().toLocaleTimeString([], {
+            hour: "2-digit",
+            minute: "2-digit",
+          }),
+        },
+      ]);
+    } catch (err) {
+      setMessages((prev) => [
+        ...prev,
+        {
+          id: `${Date.now()}-reply-error`,
+          role: "assistant",
+          text: err.message || "Something went wrong.",
+          time,
+        },
+      ]);
+    } finally {
+      setIsResponding(false);
     }
-  }, []);
-
-  useEffect(() => {
-    if (!chatWindowRef.current) return;
-    chatWindowRef.current.scrollTo({
-      top: chatWindowRef.current.scrollHeight,
-      behavior: "smooth",
-    });
-  }, [messages, isResponding]);
+  };
 
   const handleChatKeyDown = (event) => {
     if (event.key === "Enter" && !event.shiftKey) {
@@ -335,9 +474,33 @@ export default function App() {
               {messages.map((msg) => (
                 <div key={msg.id} className={`bubble ${msg.role}`}>
                   <p>{msg.text}</p>
+
+                  {msg.needsConfirmation &&
+                    pendingConfirmation?.actionRequestId === msg.actionRequestId && (
+                      <div style={{ display: "flex", gap: "8px", marginTop: "10px" }}>
+                        <button
+                          type="button"
+                          className="primary"
+                          onClick={() => sendConfirmation(true)}
+                          disabled={isResponding}
+                        >
+                          Approve
+                        </button>
+                        <button
+                          type="button"
+                          className="ghost"
+                          onClick={() => sendConfirmation(false)}
+                          disabled={isResponding}
+                        >
+                          Cancel
+                        </button>
+                      </div>
+                    )}
+
                   <span>{msg.time}</span>
                 </div>
               ))}
+
               {isResponding && (
                 <div className="responding">
                   Responding<span>.</span>
@@ -345,7 +508,6 @@ export default function App() {
                   <span>.</span>
                 </div>
               )}
-              <div ref={chatEndRef} />
             </div>
 
             <form className="chat-input" onSubmit={sendMessage}>
@@ -355,8 +517,9 @@ export default function App() {
                 value={draft}
                 onChange={(event) => setDraft(event.target.value)}
                 onKeyDown={handleChatKeyDown}
+                disabled={isResponding}
               />
-              <button type="submit" className="primary">
+              <button type="submit" className="primary" disabled={isResponding}>
                 Send
               </button>
             </form>
@@ -406,8 +569,8 @@ export default function App() {
           <p className="tag">Your Google workspace, softly arranged.</p>
           <h1>Sign in to your calm assistant.</h1>
           <p className="lede">
-            An agent that helps you with Gmail, Calendar, Docs, and more. Start
-            with an email or use Google to drop right in.
+            An agent that helps you with Gmail, Calendar, Docs, and more. Start with an email
+            or use Google to drop right in.
           </p>
           <div className="pill-row">
             <span>Gmail</span>
@@ -498,8 +661,8 @@ export default function App() {
           <div className="oauth-group" ref={oauthGroupRef}>
             {clientMissing ? (
               <div className="warning">
-                <strong>Missing client ID.</strong> Add it to{" "}
-                <code>.env</code> as <code>VITE_GOOGLE_CLIENT_ID</code>.
+                <strong>Missing client ID.</strong> Add it to <code>.env</code> as{" "}
+                <code>VITE_GOOGLE_CLIENT_ID</code>.
               </div>
             ) : (
               <div id="google-signin" className="google-button" />
@@ -512,9 +675,7 @@ export default function App() {
             <div className="status">Verifying with backend…</div>
           )}
           {backendStatus?.state === "ok" && (
-            <div className="status success">
-              Backend verified {backendStatus.payload.email}.
-            </div>
+            <div className="status success">Backend verified {backendStatus.payload.email}.</div>
           )}
           {backendStatus?.state === "error" && (
             <div className="status error">
